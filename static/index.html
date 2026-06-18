@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>PII Redactor</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <main class="card">
+    <h1>PII Redactor</h1>
+    <p class="subtitle">
+      Upload a <strong>.docx</strong> or <strong>.pdf</strong>. We strip personal
+      info and hand back a redacted copy. Nothing is stored.
+    </p>
+
+    <!-- Idle / upload -->
+    <section id="drop-zone" class="drop-zone" tabindex="0" role="button"
+             aria-label="Upload a document">
+      <svg viewBox="0 0 24 24" class="icon" aria-hidden="true">
+        <path d="M12 16V4m0 0L8 8m4-4l4 4M4 17v2a1 1 0 001 1h14a1 1 0 001-1v-2"
+              fill="none" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <p class="drop-text">Drag &amp; drop a file here</p>
+      <p class="drop-sub">or</p>
+      <button type="button" id="browse-btn" class="btn">Choose file</button>
+      <input type="file" id="file-input" accept=".docx,.pdf" hidden />
+      <p class="hint">.docx or .pdf &middot; up to 25&nbsp;MB</p>
+    </section>
+
+    <!-- Processing -->
+    <section id="processing" class="state hidden">
+      <div class="spinner" aria-hidden="true"></div>
+      <p>Removing PII from <span id="processing-name" class="fname"></span>…</p>
+    </section>
+
+    <!-- Done -->
+    <section id="done" class="state hidden">
+      <div class="check" aria-hidden="true">✓</div>
+      <p>Redacted copy ready.</p>
+      <a id="download-link" class="btn btn-primary" download>Download</a>
+      <button type="button" id="reset-btn" class="btn-link">Redact another file</button>
+    </section>
+
+    <!-- Error -->
+    <section id="error" class="state hidden">
+      <div class="cross" aria-hidden="true">!</div>
+      <p id="error-msg" class="error-msg"></p>
+      <button type="button" id="retry-btn" class="btn">Try again</button>
+    </section>
+  </main>
+
+  <footer class="foot">
+    Processed in memory · no accounts · no storage. Detection isn't perfect —
+    review the output before sharing.
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

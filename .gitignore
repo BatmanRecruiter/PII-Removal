@@ -1,0 +1,25 @@
+# Python virtual environment (hundreds of MB — recreate with uv/pip, never commit)
+.venv/
+venv/
+env/
+
+# Byte-compiled / caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Secrets / local env (this app needs none, but never commit them if added)
+.env
+.env.*
+
+# Uploaded / test documents — this is a PII tool; do NOT commit real resumes
+*.docx
+*.pdf
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
+*.swp
