@@ -5,6 +5,13 @@ returns a redacted copy in the **same format**, with formatting preserved and th
 filename suffixed with `" - Redacted"` (e.g. `Resume.docx` → `Resume - Redacted.docx`).
 Everything is processed in memory — no accounts, no database, nothing stored.
 
+You can upload **multiple files at once** (drag-drop or picker). The browser
+redacts them one at a time and shows a per-file status with an individual download
+for each — so every file keeps its own correct name and format (no zip). The batch
+cap is **20** files, set by `MAX_FILES` at the top of `static/app.js` (set it to `0`
+for unlimited). The per-file **25 MB** limit is enforced server-side
+(`MAX_UPLOAD_BYTES` in `app/config.py`).
+
 ## What gets redacted
 
 Scope is deliberately narrow for resumes:

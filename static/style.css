@@ -86,7 +86,25 @@ h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
 }
+.spinner.sm { width: 16px; height: 16px; border-width: 2px; }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- Batch file list --- */
+.batch-status { font-weight: 600; margin: 0.25rem 0 1rem; text-align: center; }
+.rows { list-style: none; margin: 0 0 0.5rem; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
+.row {
+  display: flex; align-items: center; gap: 0.6rem;
+  background: #20242f; border: 1px solid var(--border); border-radius: 8px;
+  padding: 0.55rem 0.75rem;
+}
+.row-icon { width: 18px; display: grid; place-items: center; flex: none; }
+.row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.9rem; }
+.row-detail { display: flex; align-items: center; gap: 0.5rem; font-size: 0.82rem; color: var(--muted); flex: none; }
+.row[data-state="error"] .row-detail { color: var(--error); }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: var(--border); display: inline-block; }
+.ok { color: var(--ok); font-weight: 700; }
+.bad { color: var(--error); font-weight: 700; }
+.btn-sm { padding: 0.3rem 0.7rem; font-size: 0.8rem; }
 
 .check, .cross {
   width: 44px; height: 44px; border-radius: 50%;

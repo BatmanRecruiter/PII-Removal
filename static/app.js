@@ -1,26 +1,26 @@
 "use strict";
 
 const MAX_BYTES = 25 * 1024 * 1024;
+const MAX_FILES = 20;        // batch cap; set to 0 for unlimited
 const ALLOWED_EXT = [".docx", ".pdf"];
 
 const els = {
   dropZone: document.getElementById("drop-zone"),
   fileInput: document.getElementById("file-input"),
   browseBtn: document.getElementById("browse-btn"),
-  processing: document.getElementById("processing"),
-  processingName: document.getElementById("processing-name"),
-  done: document.getElementById("done"),
-  downloadLink: document.getElementById("download-link"),
+  batch: document.getElementById("batch"),
+  batchStatus: document.getElementById("batch-status"),
+  rows: document.getElementById("rows"),
   resetBtn: document.getElementById("reset-btn"),
   error: document.getElementById("error"),
   errorMsg: document.getElementById("error-msg"),
   retryBtn: document.getElementById("retry-btn"),
 };
 
-let lastObjectUrl = null;
+let objectUrls = [];  // track for revocation
 
 function show(stateEl) {
-  for (const el of [els.dropZone, els.processing, els.done, els.error]) {
+  for (const el of [els.dropZone, els.batch, els.error]) {
     el.classList.toggle("hidden", el !== stateEl);
   }
 }
@@ -31,10 +31,9 @@ function showError(message) {
 }
 
 function resetToIdle() {
-  if (lastObjectUrl) {
-    URL.revokeObjectURL(lastObjectUrl);
-    lastObjectUrl = null;
-  }
+  objectUrls.forEach(URL.revokeObjectURL);
+  objectUrls = [];
+  els.rows.innerHTML = "";
   els.fileInput.value = "";
   show(els.dropZone);
 }
@@ -54,19 +53,47 @@ function filenameFromDisposition(header, fallback) {
   return plain ? plain[1] : fallback;
 }
 
-async function uploadFile(file) {
-  if (!ALLOWED_EXT.includes(extOf(file.name))) {
-    showError("Unsupported file type. Please choose a .docx or .pdf file.");
-    return;
-  }
-  if (file.size > MAX_BYTES) {
-    showError("File too large. The maximum size is 25 MB.");
-    return;
-  }
+// Build a row element for one file; returns handles to update its status.
+function makeRow(name) {
+  const li = document.createElement("li");
+  li.className = "row";
+  li.innerHTML = `
+    <span class="row-icon"><span class="dot" aria-hidden="true"></span></span>
+    <span class="row-name"></span>
+    <span class="row-detail"></span>`;
+  li.querySelector(".row-name").textContent = name;
+  els.rows.appendChild(li);
+  return {
+    li,
+    icon: li.querySelector(".row-icon"),
+    detail: li.querySelector(".row-detail"),
+  };
+}
 
-  els.processingName.textContent = file.name;
-  show(els.processing);
+function setRowState(row, state, html) {
+  row.li.dataset.state = state;
+  const icons = {
+    queued: '<span class="dot" aria-hidden="true"></span>',
+    processing: '<span class="spinner sm" aria-hidden="true"></span>',
+    done: '<span class="ok" aria-hidden="true">✓</span>',
+    error: '<span class="bad" aria-hidden="true">!</span>',
+  };
+  row.icon.innerHTML = icons[state] || "";
+  row.detail.innerHTML = html || "";
+}
 
+// Validate one file locally; returns an error string or null.
+function localError(file) {
+  if (!ALLOWED_EXT.includes(extOf(file.name))) return "Unsupported type (need .docx/.pdf)";
+  if (file.size > MAX_BYTES) return "Too large (max 25 MB)";
+  return null;
+}
+
+async function redactOne(file, row) {
+  const bad = localError(file);
+  if (bad) { setRowState(row, "error", bad); return false; }
+
+  setRowState(row, "processing", "Removing PII…");
   const body = new FormData();
   body.append("file", file, file.name);
 
@@ -74,32 +101,65 @@ async function uploadFile(file) {
   try {
     res = await fetch("/redact", { method: "POST", body });
   } catch (_) {
-    showError("Network error. Please check your connection and try again.");
-    return;
+    setRowState(row, "error", "Network error");
+    return false;
   }
 
   if (!res.ok) {
-    let msg = "Something went wrong while processing the file.";
+    let msg = "Failed to process";
     try {
       const data = await res.json();
-      if (data && data.error) msg = data.error;
-      else if (data && data.detail) msg = data.detail;
-    } catch (_) { /* non-JSON error body */ }
-    showError(msg);
-    return;
+      msg = (data && (data.error || data.detail)) || msg;
+    } catch (_) { /* non-JSON */ }
+    setRowState(row, "error", msg);
+    return false;
   }
 
   const blob = await res.blob();
   const fallback = file.name.replace(/(\.[^.]+)$/, " - Redacted$1");
-  const outName = filenameFromDisposition(
-    res.headers.get("Content-Disposition"), fallback
-  );
+  const outName = filenameFromDisposition(res.headers.get("Content-Disposition"), fallback);
+  const url = URL.createObjectURL(blob);
+  objectUrls.push(url);
 
-  if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
-  lastObjectUrl = URL.createObjectURL(blob);
-  els.downloadLink.href = lastObjectUrl;
-  els.downloadLink.download = outName;
-  show(els.done);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = outName;
+  link.className = "btn btn-sm";
+  link.textContent = "Download";
+  setRowState(row, "done", "");
+  row.detail.appendChild(link);
+  return true;
+}
+
+async function runBatch(files) {
+  if (MAX_FILES && files.length > MAX_FILES) {
+    showError(`You selected ${files.length} files. Please upload at most ${MAX_FILES} at a time.`);
+    return;
+  }
+  els.rows.innerHTML = "";
+  show(els.batch);
+
+  const rows = files.map((f) => makeRow(f.name));
+  files.forEach((_, i) => setRowState(rows[i], "queued", "Queued"));
+
+  els.batchStatus.textContent =
+    files.length === 1 ? "Redacting 1 file…" : `Redacting ${files.length} files…`;
+
+  let ok = 0;
+  for (let i = 0; i < files.length; i++) {
+    if (await redactOne(files[i], rows[i])) ok++;
+  }
+
+  const failed = files.length - ok;
+  els.batchStatus.textContent =
+    failed === 0
+      ? `Done — ${ok} file${ok === 1 ? "" : "s"} redacted.`
+      : `Done — ${ok} redacted, ${failed} failed.`;
+}
+
+function handleFiles(fileListLike) {
+  const files = Array.from(fileListLike);
+  if (files.length) runBatch(files);
 }
 
 // --- File picker ---
@@ -111,9 +171,7 @@ els.dropZone.addEventListener("click", (e) => {
 els.dropZone.addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") { e.preventDefault(); els.fileInput.click(); }
 });
-els.fileInput.addEventListener("change", () => {
-  if (els.fileInput.files.length) uploadFile(els.fileInput.files[0]);
-});
+els.fileInput.addEventListener("change", () => handleFiles(els.fileInput.files));
 
 // --- Drag & drop ---
 ["dragenter", "dragover"].forEach((evt) =>
@@ -128,9 +186,7 @@ els.fileInput.addEventListener("change", () => {
     els.dropZone.classList.remove("dragover");
   })
 );
-els.dropZone.addEventListener("drop", (e) => {
-  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
-});
+els.dropZone.addEventListener("drop", (e) => handleFiles(e.dataTransfer.files));
 
 // --- Reset / retry ---
 els.resetBtn.addEventListener("click", resetToIdle);
