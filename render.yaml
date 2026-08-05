@@ -8,3 +8,12 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
+      # OCR needs ~460+ MB peak alongside the web process — over this plan's
+      # 512 MB, which OOM-crash-loops the instance. Full text-layer redaction
+      # still runs; pages with text drawn as graphics get a visible warning
+      # instead. Flip to "1" only on an instance with >= 2 GB RAM.
+      - key: OCR_ENABLED
+        value: "0"
+      # Fewer glibc malloc arenas: measurably lower RSS on small instances.
+      - key: MALLOC_ARENA_MAX
+        value: "2"

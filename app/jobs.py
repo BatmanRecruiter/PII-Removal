@@ -80,7 +80,32 @@ def run_redaction(ext: str, data: bytes) -> dict:
         return {"ok": False,
                 "error": "Failed to process the document. It may be corrupt.",
                 "status": 500}
+    finally:
+        _release_memory()
     return {"ok": True, "data": out, "warnings": warnings}
+
+
+def _release_memory() -> None:
+    """Give freed memory back to the OS after a job (runs in the worker).
+
+    Python/glibc keep freed allocations in-process by default; on a 512 MB
+    instance that idle ballast is the difference between fitting and an OOM
+    kill. Best-effort — failures are ignored.
+    """
+    try:
+        import fitz
+
+        fitz.TOOLS.store_shrink(100)  # MuPDF's render/object cache
+    except Exception:
+        pass
+    try:
+        import ctypes
+        import gc
+
+        gc.collect()
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _warm_worker() -> dict:

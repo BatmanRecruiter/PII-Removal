@@ -215,6 +215,12 @@ def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
                 else:
                     page.apply_redactions()
 
+            # Drop MuPDF's internal cache of rendered/parsed objects after each
+            # page. OCR renders are large, we never revisit a finished page, and
+            # the cache otherwise holds ~100+ MB until process exit — enough to
+            # breach a 512 MB instance.
+            fitz.TOOLS.store_shrink(100)
+
         warnings: List[str] = []
         if unscanned_pages:
             pages = ", ".join(str(n) for n in unscanned_pages)
