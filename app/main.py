@@ -18,10 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import jobs
-from .analyzer import get_analyzer
 from .config import MAX_UPLOAD_BYTES
-from .redact_docx import redact_docx
-from .redact_pdf import ScannedPDFError, redact_pdf
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -29,10 +26,12 @@ STATIC_DIR = os.path.join(BASE_DIR, "static")
 DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 PDF_MIME = "application/pdf"
 
-# (extension) -> (magic-byte prefix, mime, redact function)
+# (extension) -> (magic-byte prefix, mime). The redaction functions themselves
+# are only imported inside the worker process (see app/jobs.py) so the web
+# process stays small and responsive.
 _HANDLERS = {
-    ".docx": (b"PK\x03\x04", DOCX_MIME, redact_docx),
-    ".pdf": (b"%PDF", PDF_MIME, redact_pdf),
+    ".docx": (b"PK\x03\x04", DOCX_MIME),
+    ".pdf": (b"%PDF", PDF_MIME),
 }
 
 app = FastAPI(title="PII Redactor", docs_url=None, redoc_url=None)
@@ -40,14 +39,19 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.on_event("startup")
-def preload_model() -> None:
-    """Load the spaCy model while booting, not during the first user's upload."""
-    get_analyzer()
+def warm_worker() -> None:
+    """Start the worker process and load the spaCy model there while booting."""
+    jobs.warm()
 
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    # no-store: the page references versioned assets; always fetch it fresh so
+    # a redeploy can never leave a browser running stale JavaScript.
+    return FileResponse(
+        os.path.join(STATIC_DIR, "index.html"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @app.get("/healthz")
@@ -75,16 +79,15 @@ async def redact(file: UploadFile = File(...)):
         limit_mb = MAX_UPLOAD_BYTES // (1024 * 1024)
         raise HTTPException(413, f"File too large. Maximum size is {limit_mb} MB.")
 
-    magic, mime, redact_fn = _HANDLERS[ext]
+    magic, mime = _HANDLERS[ext]
     if not data.startswith(magic):
         raise HTTPException(415, f"File content does not look like a valid {ext} file.")
 
     job_id = jobs.submit(
         filename=_redacted_name(file.filename),
         mime=mime,
+        ext=ext,
         data=data,
-        redact_fn=redact_fn,
-        known_error=ScannedPDFError,
     )
     return {"job_id": job_id}
 
