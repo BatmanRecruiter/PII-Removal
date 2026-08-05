@@ -31,7 +31,12 @@ from concurrent.futures.process import BrokenProcessPool, ProcessPoolExecutor
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
+from . import config
+
 JOB_TTL_SECONDS = 15 * 60
+# A job that is actively processing is never reaped by the normal TTL (slow
+# hardware is not abandonment); this is the backstop for a truly wedged one.
+STUCK_JOB_TTL_SECONDS = 60 * 60
 
 _orchestrator = ThreadPoolExecutor(max_workers=1)  # serializes jobs, cheap threads
 _lock = threading.Lock()
@@ -136,7 +141,10 @@ def warm() -> None:
     """Fire-and-forget worker warm-up; call once at app startup."""
     def kick() -> None:
         try:
-            _get_pool().submit(_warm_worker).result()
+            if config.JOB_WORKER == "thread":
+                _warm_worker()
+            else:
+                _get_pool().submit(_warm_worker).result()
         except Exception:
             _reset_pool()  # worker will be recreated on the first real job
 
@@ -146,8 +154,11 @@ def warm() -> None:
 def _purge_expired() -> None:
     now = time.time()
     with _lock:
-        for job_id in [j for j, job in _jobs.items() if now - job.created > JOB_TTL_SECONDS]:
-            del _jobs[job_id]
+        for job_id, job in list(_jobs.items()):
+            age = now - job.created
+            limit = STUCK_JOB_TTL_SECONDS if job.state == "processing" else JOB_TTL_SECONDS
+            if age > limit:
+                del _jobs[job_id]
 
 
 def submit(filename: str, mime: str, ext: str, data: bytes) -> str:
@@ -161,7 +172,13 @@ def submit(filename: str, mime: str, ext: str, data: bytes) -> str:
         with _lock:
             job.state = "processing"
         try:
-            res = _get_pool().submit(run_redaction, ext, data).result()
+            if config.JOB_WORKER == "thread":
+                # In-process execution: ~100 MB smaller (no second interpreter),
+                # the only shape that fits a 512 MB instance. run_redaction
+                # never raises — it reports failures in its dict.
+                res = run_redaction(ext, data)
+            else:
+                res = _get_pool().submit(run_redaction, ext, data).result()
         except BrokenProcessPool:
             _reset_pool()
             res = {"ok": False, "status": 500,

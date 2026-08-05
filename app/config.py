@@ -30,6 +30,16 @@ REDACT_IMAGES = os.getenv("REDACT_IMAGES", "1") not in ("0", "false", "False")
 # Such "text" has no characters to search; those pages get an extra OCR pass.
 VECTOR_TEXT_CURVE_THRESHOLD = int(os.getenv("VECTOR_TEXT_CURVE_THRESHOLD", "100"))
 
+# How background jobs execute (see app/jobs.py):
+#   "process" — separate worker process; keeps the web process responsive even
+#               during minutes of CPU-pegged OCR. Costs ~100 MB extra (two
+#               interpreters). Right choice when OCR is on (needs >= 2 GB).
+#   "thread"  — worker thread in the web process; ~100 MB smaller, the only
+#               shape that fits a 512 MB instance with the md model. Polls can
+#               lag a little while a job runs (GIL), which is acceptable for
+#               short OCR-less jobs.
+JOB_WORKER = os.getenv("JOB_WORKER", "process")
+
 # --- OCR (for text drawn as graphics) ---------------------------------------
 # PyMuPDF wheels embed Tesseract; only the language data file is needed.
 # `tessdata/eng.traineddata` is committed to the repo.

@@ -14,6 +14,11 @@ services:
       # instead. Flip to "1" only on an instance with >= 2 GB RAM.
       - key: OCR_ENABLED
         value: "0"
+      # In-process worker: the separate-process worker duplicates ~100 MB of
+      # interpreter+libraries, which pushed this 512 MB instance into
+      # memory-thrash (first live job sat "processing" for 15+ minutes).
+      - key: JOB_WORKER
+        value: "thread"
       # Fewer glibc malloc arenas: measurably lower RSS on small instances.
       - key: MALLOC_ARENA_MAX
         value: "2"
