@@ -65,6 +65,24 @@ python -m tests.verify        # 38 redaction checks (DOCX/PDF/analyzer/OCR, in-m
 python -m tests.verify_http   # 21 full-stack checks (routing, job flow, headers, errors)
 ```
 
+## Local redaction with full OCR
+
+The hosted free-tier site runs with `OCR_ENABLED=0` — the 512 MB instance can't
+fit the detection model (~373 MB) plus OCR's peak (~90–130 MB) plus the web
+process, and OOM-kills. Pages whose text is drawn as graphics therefore only
+get a warning on the website. For those files, run the identical pipeline
+locally with OCR on:
+
+```bash
+.venv/bin/python -m tools.redact_local "C:\Users\you\Downloads\resume.pdf"
+.venv/bin/python -m tools.redact_local ~/Downloads            # whole folder
+```
+
+Windows-style paths are auto-converted under WSL. Output lands next to each
+input as `<name> - Redacted<ext>`; existing files are never overwritten. To run
+OCR on the website instead, deploy on an instance with **≥ 2 GB RAM** and set
+`OCR_ENABLED=1`.
+
 ## Deploy (Render, free tier)
 
 Push the repo and create a Blueprint from `render.yaml`. It pins Python via the
