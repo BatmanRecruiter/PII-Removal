@@ -23,6 +23,9 @@ Scope is deliberately narrow for resumes:
 | Phone number | Presidio `PHONE_NUMBER` |
 | URLs / links | Presidio `URL` + a regex for scheme-less links (linkedin.com/in/…, github.com/…) |
 | Street address (if present) | Custom street-address regex recognizer |
+| Embedded pictures (headshots) | Blacked out in PDFs / removed from DOCX (`REDACT_IMAGES=0` to keep) |
+| Hyperlink targets | Link annotations with `mailto:`/`tel:`/PII URIs are deleted from PDFs |
+| Text drawn as graphics | OCR pass (PyMuPDF's embedded Tesseract) on pages with vector letter outlines |
 
 Replaced uniformly with the token **`[REDACTED]`** (in PDFs the underlying text is
 truly deleted, then a black box with the label is drawn).
@@ -47,7 +50,7 @@ uvicorn app.main:app --reload
 Run from the project root so the `app` package resolves:
 
 ```bash
-python -m tests.verify        # 29 redaction checks (DOCX/PDF/analyzer, in-memory fixtures)
+python -m tests.verify        # 38 redaction checks (DOCX/PDF/analyzer/OCR, in-memory fixtures)
 python -m tests.verify_http   # 16 full-stack checks (routing, upload, headers, errors)
 ```
 
@@ -72,10 +75,24 @@ instance).
 - **DOCX out of scope:** text inside images, SmartArt, embedded objects, and
   field-code results. (Body, tables, headers, footers, text boxes, and
   footnotes/comments are covered.)
-- **PDF edge cases:** rotated/vector-outlined text may not map to word rectangles;
-  a `search_for` fallback mitigates but isn't total.
+- **Text drawn as graphics is OCR-redacted (slower).** Some exporters (Google Docs
+  themes, Canva, etc.) convert stylized headers/sidebars to vector letter
+  *outlines* — shapes, not characters, so normal text search can't see them.
+  Pages that look like they contain outlined text get an OCR pass using the
+  Tesseract engine **embedded in the PyMuPDF wheel** (no system install; only
+  `tessdata/eng.traineddata`, committed to the repo, is needed). OCR findings are
+  trusted only where the text layer is blind, and redactions on those pages also
+  delete touched vector line art so outlines are removed, not just covered.
+  Budget ~10 s per affected page. If OCR can't run (e.g. tessdata missing), the
+  app returns a per-file warning (shown in the UI via the `X-Redaction-Warnings`
+  response header) naming the pages to review manually. OCR is best-effort:
+  unusual fonts/colors can still evade it — spot-check stylized documents.
+- **Invisible characters are neutralized.** Zero-width spaces and similar
+  characters that some exporters glue onto words (which used to hide names from
+  the NER model) are converted to spaces before analysis.
 
 ## Configuration (`app/config.py`, env-overridable)
 
 `SPACY_MODEL`, `SCORE_THRESHOLD`, `REDACTION_TOKEN`, `MAX_UPLOAD_BYTES`,
-`SCANNED_PDF_MIN_CHARS_PER_PAGE`.
+`SCANNED_PDF_MIN_CHARS_PER_PAGE`, `REDACT_IMAGES`, `VECTOR_TEXT_CURVE_THRESHOLD`,
+`OCR_ENABLED`, `TESSDATA_DIR`, `OCR_DPI`.

@@ -21,11 +21,15 @@ from typing import Dict, List, Optional, Tuple
 from docx import Document
 from docx.oxml.ns import qn
 
+from . import config
 from .analyzer import analyze_text
 from .config import REDACTION_TOKEN
 
 _W_P = qn("w:p")
 _W_T = qn("w:t")
+# Containers for embedded pictures: DrawingML (modern) and VML (legacy).
+_W_DRAWING = qn("w:drawing")
+_W_PICT = qn("w:pict")
 _XML_SPACE = "{http://www.w3.org/XML/1998/namespace}space"
 
 
@@ -124,13 +128,22 @@ def _scrub_metadata(doc) -> None:
                     child.text = ""
 
 
-def redact_docx(data: bytes) -> bytes:
-    """Redact PII from DOCX bytes and return the redacted DOCX bytes."""
+def _remove_images(root) -> None:
+    """Drop every embedded picture (resume headshots are PII)."""
+    for tag in (_W_DRAWING, _W_PICT):
+        for elem in list(root.iter(tag)):
+            elem.getparent().remove(elem)
+
+
+def redact_docx(data: bytes) -> Tuple[bytes, List[str]]:
+    """Redact PII from DOCX bytes; return (redacted bytes, user-facing warnings)."""
     doc = Document(BytesIO(data))
     for root in _iter_story_roots(doc):
         for _paragraph, t_elements in _group_by_paragraph(root).items():
             _redact_run_group(t_elements)
+        if config.REDACT_IMAGES:
+            _remove_images(root)
     _scrub_metadata(doc)
     out = BytesIO()
     doc.save(out)
-    return out.getvalue()
+    return out.getvalue(), []

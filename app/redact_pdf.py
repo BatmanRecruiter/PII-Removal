@@ -5,14 +5,27 @@ call `apply_redactions()`, which removes the underlying glyphs and then paints a
 black box with the `[REDACTED]` label. Re-extracting text over the box yields
 nothing.
 
+Beyond the text layer we also handle:
+- Embedded pictures (headshots are PII) — blacked out when REDACT_IMAGES is on.
+- Link annotations — a "LinkedIn" anchor whose visible text is harmless can still
+  carry a mailto:/tel:/profile URI; links with PII in the URI are deleted.
+- Text converted to vector outlines (letter shapes drawn as graphics, common in
+  Google Docs / Canva exports). There are no characters to search, so pages that
+  look like they contain outlined text get an extra OCR pass (PyMuPDF's embedded
+  Tesseract). OCR findings are only trusted where the real text layer is blind,
+  so OCR noise can't black out body text the normal pass already handled. On
+  those pages redactions also remove touched vector line art, so the letter
+  outlines are deleted, not merely covered. If OCR can't run (missing tessdata),
+  we return a warning naming the affected pages instead of failing silently.
+
 Image-only / scanned PDFs have no text layer to search, so we reject them (v1).
 """
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import fitz
 
+from . import config
 from .analyzer import analyze_text
-from .config import REDACTION_TOKEN, SCANNED_PDF_MIN_CHARS_PER_PAGE
 
 
 class ScannedPDFError(Exception):
@@ -24,13 +37,23 @@ def _is_scanned(doc) -> bool:
     if page_count == 0:
         return True
     total_chars = sum(len(page.get_text("text").strip()) for page in doc)
-    return total_chars < SCANNED_PDF_MIN_CHARS_PER_PAGE * page_count
+    return total_chars < config.SCANNED_PDF_MIN_CHARS_PER_PAGE * page_count
 
 
-def _redact_page(page) -> None:
-    words = page.get_text("words")  # (x0, y0, x1, y1, word, block, line, word_no)
+def _annots_for_words(
+    page,
+    words: List[tuple],
+    skip_rects: Optional[List[fitz.Rect]] = None,
+    use_search_fallback: bool = False,
+) -> int:
+    """Detect PII across `words` and add redaction annots. Returns annot count.
+
+    `words` are PyMuPDF word tuples (x0, y0, x1, y1, word, block, line, word_no).
+    `skip_rects`: word boxes mostly inside any of these rects are ignored (used
+    by the OCR pass to defer to the text-layer pass in areas it already covers).
+    """
     if not words:
-        return
+        return 0
 
     # Reconstruct page text, tracking each word's char range so PII spans
     # (computed on the text) map back to word rectangles.
@@ -44,21 +67,23 @@ def _redact_page(page) -> None:
         pos += len(token) + 1  # +1 for the joining space
     text = " ".join(parts)
 
-    spans = analyze_text(text)
-    if not spans:
-        return
-
-    for a, b in spans:
+    added = 0
+    for a, b in analyze_text(text):
         # Group intersecting words by (block, line) so a multi-line span draws
         # one box per line instead of one huge box spanning unrelated content.
         groups: Dict[Tuple[int, int], List[fitz.Rect]] = {}
         for ws, we, w in offsets:
             if ws < b and we > a:  # word intersects the PII span
-                groups.setdefault((w[5], w[6]), []).append(fitz.Rect(w[0], w[1], w[2], w[3]))
+                rect = fitz.Rect(w[0], w[1], w[2], w[3])
+                if skip_rects is not None and _mostly_covered(rect, skip_rects):
+                    continue
+                groups.setdefault((w[5], w[6]), []).append(rect)
 
-        if not groups:  # fallback: locate the literal substring on the page
-            for rect in page.search_for(text[a:b]):
-                _add_annot(page, rect)
+        if not groups:
+            if use_search_fallback:  # locate the literal substring on the page
+                for rect in page.search_for(text[a:b]):
+                    _add_annot(page, rect)
+                    added += 1
             continue
 
         for rects in groups.values():
@@ -66,24 +91,90 @@ def _redact_page(page) -> None:
             for extra in rects[1:]:
                 rect |= extra
             _add_annot(page, rect)
+            added += 1
+    return added
 
-    page.apply_redactions()
+
+def _mostly_covered(rect: fitz.Rect, others: List[fitz.Rect]) -> bool:
+    """True if a meaningful share of `rect` overlaps any rect in `others`.
+
+    Truly invisible content (vector outlines) overlaps the text layer at ~0.00;
+    OCR reads of real text overlap at ~0.5+ even when OCR merges two lines into
+    one tall box. 0.3 splits the two cleanly.
+    """
+    area = abs(rect)
+    if area <= 0:
+        return True
+    for other in others:
+        if abs(rect & other) >= 0.3 * area:
+            return True
+    return False
 
 
-def _add_annot(page, rect: fitz.Rect) -> None:
-    fontsize = max(6.0, min(10.0, rect.height - 2.0))
-    page.add_redact_annot(
-        rect,
-        text=REDACTION_TOKEN,
-        fontsize=fontsize,
-        fill=(0, 0, 0),
-        text_color=(1, 1, 1),
-        align=fitz.TEXT_ALIGN_CENTER,
+def _redact_page_images(page) -> int:
+    """Black out every embedded picture (headshots are PII). Returns annot count."""
+    added = 0
+    for img in page.get_images(full=True):
+        for rect in page.get_image_rects(img[0]):
+            if not rect.is_empty:
+                _add_annot(page, rect)
+                added += 1
+    return added
+
+
+def _delete_pii_links(page) -> None:
+    """Remove link annotations whose target URI itself contains PII.
+
+    The visible anchor text is handled by the text pass; this catches the URI
+    hiding underneath (mailto:, tel:, personal profile URLs).
+    """
+    for link in page.get_links():
+        uri = link.get("uri") or ""
+        if not uri:
+            continue
+        if uri.lower().startswith(("mailto:", "tel:")) or analyze_text(uri):
+            page.delete_link(link)
+
+
+def _has_vector_text(page) -> bool:
+    """Heuristic: does this page contain text converted to vector outlines?
+
+    Letter shapes drawn as filled bezier paths (no font, no characters) show up
+    as fill-drawings with many curve segments. Ordinary decoration (rules,
+    boxes, a circular photo mask) stays far below the threshold.
+    """
+    curves = 0
+    for drawing in page.get_drawings():
+        if drawing.get("fill") is None:
+            continue
+        curves += sum(1 for item in drawing["items"] if item[0] == "c")
+        if curves >= config.VECTOR_TEXT_CURVE_THRESHOLD:
+            return True
+    return False
+
+
+def _ocr_annots(page, text_words: List[tuple]) -> int:
+    """OCR the rendered page and redact PII the text layer can't see.
+
+    Raises on any OCR failure (e.g. missing tessdata) — the caller downgrades
+    that to a user-facing warning.
+    """
+    textpage = page.get_textpage_ocr(
+        flags=0,
+        language="eng",
+        dpi=config.OCR_DPI,
+        full=True,  # OCR the whole rendered page, not just embedded images
+        tessdata=config.TESSDATA_DIR,
     )
+    ocr_words = page.get_text("words", textpage=textpage)
+    # Areas the text layer already covers are the text pass's responsibility;
+    # ignoring them there keeps OCR misreads from redacting good body text.
+    covered = [fitz.Rect(w[:4]) for w in text_words]
+    return _annots_for_words(page, ocr_words, skip_rects=covered)
 
 
-def redact_pdf(data: bytes) -> bytes:
-    """Redact PII from PDF bytes and return redacted PDF bytes.
+def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
+    """Redact PII from PDF bytes; return (redacted bytes, user-facing warnings).
 
     Raises ScannedPDFError if the PDF appears to be image-only.
     """
@@ -94,8 +185,44 @@ def redact_pdf(data: bytes) -> bytes:
                 "This PDF appears to be scanned or image-only (no selectable text). "
                 "Text-based redaction can't run on it. OCR isn't supported yet."
             )
+
+        unscanned_pages: List[int] = []
         for page in doc:
-            _redact_page(page)
+            _delete_pii_links(page)
+            text_words = page.get_text("words")
+            annots = _annots_for_words(page, text_words, use_search_fallback=True)
+            if config.REDACT_IMAGES:
+                annots += _redact_page_images(page)
+
+            ocr_ran = False
+            if _has_vector_text(page):
+                if config.OCR_ENABLED:
+                    try:
+                        annots += _ocr_annots(page, text_words)
+                        ocr_ran = True
+                    except Exception:
+                        unscanned_pages.append(page.number + 1)
+                else:
+                    unscanned_pages.append(page.number + 1)
+
+            if annots:
+                if ocr_ran:
+                    # Delete vector line art touched by a redaction box so letter
+                    # outlines are truly removed, not hidden under the box.
+                    page.apply_redactions(
+                        graphics=fitz.PDF_REDACT_LINE_ART_REMOVE_IF_TOUCHED
+                    )
+                else:
+                    page.apply_redactions()
+
+        warnings: List[str] = []
+        if unscanned_pages:
+            pages = ", ".join(str(n) for n in unscanned_pages)
+            warnings.append(
+                f"Page{'s' if len(unscanned_pages) > 1 else ''} {pages}: some text "
+                "is drawn as graphics (letter outlines) and OCR could not run, so "
+                "those areas were NOT scanned for PII. Please review them manually."
+            )
 
         doc.set_metadata({})  # clear /Info (author, title, producer, ...)
         try:
@@ -103,6 +230,18 @@ def redact_pdf(data: bytes) -> bytes:
         except Exception:
             pass
 
-        return doc.tobytes(garbage=4, deflate=True)
+        return doc.tobytes(garbage=4, deflate=True), warnings
     finally:
         doc.close()
+
+
+def _add_annot(page, rect: fitz.Rect) -> None:
+    fontsize = max(6.0, min(10.0, rect.height - 2.0))
+    page.add_redact_annot(
+        rect,
+        text=config.REDACTION_TOKEN,
+        fontsize=fontsize,
+        fill=(0, 0, 0),
+        text_color=(1, 1, 1),
+        align=fitz.TEXT_ALIGN_CENTER,
+    )

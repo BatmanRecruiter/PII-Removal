@@ -5,6 +5,7 @@ name, email, phone, URLs, and a street address if one is present. Dates,
 graduation years, and job-history city names are intentionally left intact, so
 broad LOCATION / DATE_TIME and the various ID entities are NOT enabled.
 """
+import re
 from functools import lru_cache
 from typing import List, Tuple
 
@@ -104,16 +105,25 @@ def _merge_spans(spans: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
     return [(s, e) for s, e in merged]
 
 
+# Invisible characters that documents (notably Google Docs exports) glue onto
+# words: zero-width space/joiners, word joiner, BOM, soft hyphen, plus NBSP.
+# They wreck NER — spaCy sees "​Harlan​ Smith" as one garbage token,
+# not a name. Each is replaced with a regular space (same string length, so
+# span offsets still line up with the caller's original text).
+_INVISIBLE_RE = re.compile("[\u00a0\u00ad\u200b\u200c\u200d\u2060\ufeff]")
+
+
 def analyze_text(text: str) -> List[Tuple[int, int]]:
     """Return disjoint (start, end) character spans of PII within `text`.
 
     Spans are merged so callers can replace them without worrying about
     overlapping detections (e.g. an email whose domain also matches a URL).
+    Offsets always refer to `text` exactly as passed in.
     """
     if not text or not text.strip():
         return []
     results = get_analyzer().analyze(
-        text=text,
+        text=_INVISIBLE_RE.sub(" ", text),
         language="en",
         entities=ANALYZED_ENTITIES,
     )

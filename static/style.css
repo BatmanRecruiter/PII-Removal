@@ -93,9 +93,13 @@ h1 { margin: 0 0 0.25rem; font-size: 1.5rem; }
 .batch-status { font-weight: 600; margin: 0.25rem 0 1rem; text-align: center; }
 .rows { list-style: none; margin: 0 0 0.5rem; padding: 0; display: flex; flex-direction: column; gap: 0.5rem; }
 .row {
-  display: flex; align-items: center; gap: 0.6rem;
+  display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap;
   background: #20242f; border: 1px solid var(--border); border-radius: 8px;
   padding: 0.55rem 0.75rem;
+}
+.row-warning {
+  flex-basis: 100%; margin: 0.15rem 0 0; font-size: 0.78rem;
+  line-height: 1.35; color: #e8b339;
 }
 .row-icon { width: 18px; display: grid; place-items: center; flex: none; }
 .row-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.9rem; }

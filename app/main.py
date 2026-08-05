@@ -3,6 +3,7 @@
 Everything is processed in memory — no file is ever written to disk and nothing
 is persisted between requests.
 """
+import json
 import os
 from io import BytesIO
 from urllib.parse import quote
@@ -65,7 +66,7 @@ async def redact(file: UploadFile = File(...)):
         raise HTTPException(415, f"File content does not look like a valid {ext} file.")
 
     try:
-        result = redact_fn(data)
+        result, warnings = redact_fn(data)
     except ScannedPDFError as exc:
         return JSONResponse(status_code=422, content={"error": str(exc)})
     except Exception:
@@ -73,9 +74,12 @@ async def redact(file: UploadFile = File(...)):
 
     out_name = _redacted_name(file.filename)
     # RFC 5987 encoding handles spaces/unicode in the filename safely.
-    disposition = f"attachment; filename*=UTF-8''{quote(out_name)}"
+    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(out_name)}"}
+    if warnings:
+        # Header values must be latin-1; percent-encode the JSON list to be safe.
+        headers["X-Redaction-Warnings"] = quote(json.dumps(warnings))
     return StreamingResponse(
         BytesIO(result),
         media_type=mime,
-        headers={"Content-Disposition": disposition},
+        headers=headers,
     )

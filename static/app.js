@@ -82,6 +82,17 @@ function setRowState(row, state, html) {
   row.detail.innerHTML = html || "";
 }
 
+// The server sends warnings as a percent-encoded JSON array in a header.
+function parseWarnings(header) {
+  if (!header) return [];
+  try {
+    const list = JSON.parse(decodeURIComponent(header));
+    return Array.isArray(list) ? list : [];
+  } catch (_) {
+    return [];
+  }
+}
+
 // Validate one file locally; returns an error string or null.
 function localError(file) {
   if (!ALLOWED_EXT.includes(extOf(file.name))) return "Unsupported type (need .docx/.pdf)";
@@ -128,6 +139,14 @@ async function redactOne(file, row) {
   link.textContent = "Download";
   setRowState(row, "done", "");
   row.detail.appendChild(link);
+
+  // Server-side warnings (e.g. text drawn as graphics that couldn't be scanned).
+  for (const msg of parseWarnings(res.headers.get("X-Redaction-Warnings"))) {
+    const warn = document.createElement("p");
+    warn.className = "row-warning";
+    warn.textContent = "⚠ " + msg;
+    row.li.appendChild(warn);
+  }
   return true;
 }
 
