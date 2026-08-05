@@ -25,7 +25,7 @@ from typing import Dict, List, Optional, Tuple
 import fitz
 
 from . import config
-from .analyzer import analyze_text
+from .analyzer import analyze_text, unload_analyzer
 
 
 class ScannedPDFError(Exception):
@@ -153,12 +153,19 @@ def _has_vector_text(page) -> bool:
     return False
 
 
-def _ocr_annots(page, text_words: List[tuple]) -> int:
-    """OCR the rendered page and redact PII the text layer can't see.
+# Pages larger than this (points; ~2x A4 area) are not OCR'd: the render buffer
+# scales with page area and would blow past a small instance's memory.
+_MAX_OCR_PAGE_AREA = 2 * 595 * 842
 
-    Raises on any OCR failure (e.g. missing tessdata) — the caller downgrades
-    that to a user-facing warning.
+
+def _ocr_words(page) -> List[tuple]:
+    """OCR the rendered page and return its word tuples.
+
+    Raises on any OCR failure (e.g. missing tessdata, oversized page) — the
+    caller downgrades that to a user-facing warning.
     """
+    if abs(page.rect) > _MAX_OCR_PAGE_AREA:
+        raise ValueError("page too large for OCR")
     textpage = page.get_textpage_ocr(
         flags=0,
         language="eng",
@@ -166,11 +173,7 @@ def _ocr_annots(page, text_words: List[tuple]) -> int:
         full=True,  # OCR the whole rendered page, not just embedded images
         tessdata=config.TESSDATA_DIR,
     )
-    ocr_words = page.get_text("words", textpage=textpage)
-    # Areas the text layer already covers are the text pass's responsibility;
-    # ignoring them there keeps OCR misreads from redacting good body text.
-    covered = [fitz.Rect(w[:4]) for w in text_words]
-    return _annots_for_words(page, ocr_words, skip_rects=covered)
+    return page.get_text("words", textpage=textpage)
 
 
 def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
@@ -187,23 +190,48 @@ def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
             )
 
         unscanned_pages: List[int] = []
-        for page in doc:
-            _delete_pii_links(page)
+
+        # --- Pass 1: gather words (text layer + OCR), NO language analysis ---
+        # Kept strictly NLP-free so that in OCR_LOW_MEMORY mode the spaCy model
+        # and Tesseract are never in memory at the same time: together they
+        # exceed a 512 MB instance and get the container OOM-killed.
+        has_vector_text = [_has_vector_text(page) for page in doc]
+        if config.OCR_ENABLED and config.OCR_LOW_MEMORY and any(has_vector_text):
+            unload_analyzer()
+
+        gathered: List[Tuple[List[tuple], Optional[List[tuple]]]] = []
+        for page, vector_text in zip(doc, has_vector_text):
             text_words = page.get_text("words")
+            ocr_words: Optional[List[tuple]] = None
+            if vector_text and config.OCR_ENABLED:
+                try:
+                    ocr_words = _ocr_words(page)
+                except Exception:
+                    unscanned_pages.append(page.number + 1)
+            elif vector_text:
+                unscanned_pages.append(page.number + 1)
+            gathered.append((text_words, ocr_words))
+            fitz.TOOLS.store_shrink(100)  # drop OCR render from MuPDF's cache
+
+        if any(w[1] is not None for w in gathered):
+            # Hand Tesseract's freed working set back to the OS before the
+            # model reloads on top of it — RSS peaks stack otherwise.
+            _trim_ram()
+
+        # --- Pass 2: analyze and redact (model loads lazily on first use) ----
+        for page, (text_words, ocr_words) in zip(doc, gathered):
+            _delete_pii_links(page)
             annots = _annots_for_words(page, text_words, use_search_fallback=True)
             if config.REDACT_IMAGES:
                 annots += _redact_page_images(page)
 
-            ocr_ran = False
-            if _has_vector_text(page):
-                if config.OCR_ENABLED:
-                    try:
-                        annots += _ocr_annots(page, text_words)
-                        ocr_ran = True
-                    except Exception:
-                        unscanned_pages.append(page.number + 1)
-                else:
-                    unscanned_pages.append(page.number + 1)
+            ocr_ran = ocr_words is not None
+            if ocr_ran:
+                # Areas the text layer already covers are the text pass's
+                # responsibility; skipping them keeps OCR misreads from
+                # redacting good body text.
+                covered = [fitz.Rect(w[:4]) for w in text_words]
+                annots += _annots_for_words(page, ocr_words, skip_rects=covered)
 
             if annots:
                 if ocr_ran:
@@ -215,10 +243,8 @@ def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
                 else:
                     page.apply_redactions()
 
-            # Drop MuPDF's internal cache of rendered/parsed objects after each
-            # page. OCR renders are large, we never revisit a finished page, and
-            # the cache otherwise holds ~100+ MB until process exit — enough to
-            # breach a 512 MB instance.
+            # We never revisit a finished page; without this the cache holds
+            # ~100+ MB until process exit — enough to breach a 512 MB instance.
             fitz.TOOLS.store_shrink(100)
 
         warnings: List[str] = []
@@ -239,6 +265,18 @@ def redact_pdf(data: bytes) -> Tuple[bytes, List[str]]:
         return doc.tobytes(garbage=4, deflate=True), warnings
     finally:
         doc.close()
+
+
+def _trim_ram() -> None:
+    """Best-effort: return freed heap memory to the OS (glibc keeps it otherwise)."""
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _add_annot(page, rect: fitz.Rect) -> None:

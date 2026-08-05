@@ -89,28 +89,39 @@ function sleep(ms) {
 }
 
 // Poll the job until it finishes; returns {ok, warnings?, error?}.
-// Slow is normal here: OCR-heavy files take minutes on the small server.
+// Slow is normal here: OCR-heavy files take minutes on the small server, and
+// while one is processing the server may answer polls sluggishly. The elapsed
+// counter ticks on a local timer so the UI visibly stays alive regardless.
 async function waitForJob(jobId, row) {
   const started = Date.now();
-  for (;;) {
-    await sleep(POLL_MS);
-    let res;
-    try {
-      res = await fetch(`/jobs/${jobId}`);
-    } catch (_) {
-      continue; // transient network blip — keep polling
-    }
-    if (res.status === 404) return { ok: false, error: "Job expired — please retry" };
-    let data = {};
-    try { data = await res.json(); } catch (_) { /* keep polling */ }
-    if (!res.ok) return { ok: false, error: data.error || data.detail || "Failed to process" };
-
-    if (data.state === "done") return { ok: true, warnings: data.warnings || [] };
+  const latest = { queuedBehind: 0 };
+  const ticker = setInterval(() => {
     const secs = Math.round((Date.now() - started) / 1000);
-    const note = data.state === "queued" && data.queue_position > 0
-      ? `Waiting (${data.queue_position} ahead)…`
+    const note = latest.queuedBehind > 0
+      ? `Waiting (${latest.queuedBehind} ahead)…`
       : `Removing PII… ${secs}s`;
     setRowState(row, "processing", note);
+  }, 1000);
+
+  try {
+    for (;;) {
+      await sleep(POLL_MS);
+      let res;
+      try {
+        res = await fetch(`/jobs/${jobId}`);
+      } catch (_) {
+        continue; // transient network blip — keep polling
+      }
+      if (res.status === 404) return { ok: false, error: "Job expired — please retry" };
+      let data = {};
+      try { data = await res.json(); } catch (_) { /* keep polling */ }
+      if (!res.ok) return { ok: false, error: data.error || data.detail || "Failed to process" };
+
+      if (data.state === "done") return { ok: true, warnings: data.warnings || [] };
+      latest.queuedBehind = data.state === "queued" ? (data.queue_position || 0) : 0;
+    }
+  } finally {
+    clearInterval(ticker);
   }
 }
 

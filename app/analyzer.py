@@ -6,6 +6,7 @@ graduation years, and job-history city names are intentionally left intact, so
 broad LOCATION / DATE_TIME and the various ID entities are NOT enabled.
 """
 import re
+import threading
 from functools import lru_cache
 from typing import List, Tuple
 
@@ -73,8 +74,39 @@ def _build_custom_recognizers() -> List[PatternRecognizer]:
     return [street, loose_url]
 
 
-@lru_cache(maxsize=1)
+# Serializes model load vs. unload: without it, a job's pre-OCR unload can race
+# a still-running startup warm-up, leaving the model resident during OCR — the
+# exact memory stacking OCR_LOW_MEMORY exists to prevent.
+_engine_lock = threading.RLock()
+
+
+def unload_analyzer() -> None:
+    """Drop the cached engine and give its memory back to the OS.
+
+    Exists for memory-tight hosts (see OCR_LOW_MEMORY): the spaCy model
+    (~210 MB) and Tesseract's working set can't both fit in 512 MB, so the
+    model is evicted before OCR and lazily reloaded for the analysis pass.
+    """
+    with _engine_lock:
+        _build_analyzer.cache_clear()
+    import ctypes
+    import gc
+
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def get_analyzer() -> AnalyzerEngine:
+    """Return the cached AnalyzerEngine, building (model load) if needed."""
+    with _engine_lock:
+        return _build_analyzer()
+
+
+@lru_cache(maxsize=1)
+def _build_analyzer() -> AnalyzerEngine:
     """Lazily build and cache a single AnalyzerEngine (loads the spaCy model once)."""
     provider = NlpEngineProvider(
         nlp_configuration={

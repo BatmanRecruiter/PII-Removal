@@ -46,6 +46,11 @@ JOB_WORKER = os.getenv("JOB_WORKER", "process")
 _BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OCR_ENABLED = os.getenv("OCR_ENABLED", "1") not in ("0", "false", "False")
 TESSDATA_DIR = os.getenv("TESSDATA_DIR", os.path.join(_BASE_DIR, "tessdata"))
-# Render resolution for the OCR pass. 200 dpi reads clean digital output well
-# and stays inside a 512 MB instance; raise for higher fidelity.
+# Render resolution for the OCR pass. 200 dpi reads clean digital output well;
+# 150 still reads resume-sized text and shaves ~30 MB peak on tight instances.
 OCR_DPI = int(os.getenv("OCR_DPI", "200"))
+
+# Memory-tight OCR mode for 512 MB instances: evict the spaCy model before the
+# OCR phase (they don't fit simultaneously) and reload it for analysis. Costs a
+# model reload per OCR'd document; irrelevant on hosts with >= 2 GB.
+OCR_LOW_MEMORY = os.getenv("OCR_LOW_MEMORY", "0") not in ("0", "false", "False")

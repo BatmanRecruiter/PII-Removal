@@ -8,12 +8,16 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: "3.11.9"
-      # OCR needs ~460+ MB peak alongside the web process — over this plan's
-      # 512 MB, which OOM-crash-loops the instance. Full text-layer redaction
-      # still runs; pages with text drawn as graphics get a visible warning
-      # instead. Flip to "1" only on an instance with >= 2 GB RAM.
+      # OCR on, in low-memory mode: the spaCy model is evicted before the OCR
+      # phase and reloaded for analysis, so the two never stack (~472 MB peak
+      # measured vs the 512 MB limit). Costs a model reload per OCR'd file.
       - key: OCR_ENABLED
-        value: "0"
+        value: "1"
+      - key: OCR_LOW_MEMORY
+        value: "1"
+      # 150 dpi: reads resume-sized text reliably, smaller OCR buffers.
+      - key: OCR_DPI
+        value: "150"
       # In-process worker: the separate-process worker duplicates ~100 MB of
       # interpreter+libraries, which pushed this 512 MB instance into
       # memory-thrash (first live job sat "processing" for 15+ minutes).
