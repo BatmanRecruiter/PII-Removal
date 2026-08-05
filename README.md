@@ -3,7 +3,18 @@
 A stateless web app that strips PII from uploaded resumes (`.docx` / `.pdf`) and
 returns a redacted copy in the **same format**, with formatting preserved and the
 filename suffixed with `" - Redacted"` (e.g. `Resume.docx` → `Resume - Redacted.docx`).
-Everything is processed in memory — no accounts, no database, nothing stored.
+Everything is processed in memory — no accounts, no database, nothing written to
+disk. A finished result is held in RAM only until it's downloaded (or for at most
+15 minutes), because redaction runs as a **background job**: `POST /redact`
+validates the upload and immediately returns `{"job_id": ...}`; the browser polls
+`GET /jobs/{id}` (`queued` / `processing` / `done` + `warnings`, or an error) and
+then fetches `GET /jobs/{id}/download` once. This keeps requests short — OCR-heavy
+files can take minutes on a small instance, long-held HTTP requests get killed by
+the hosting proxy, and the old inline approach starved the event loop (even
+`/healthz` went dark during OCR). One worker thread processes jobs sequentially
+on purpose: a fraction-of-a-CPU instance running two OCR passes at once would
+just crawl and double peak memory. The spaCy model is preloaded at startup so
+the first upload doesn't pay for it.
 
 You can upload **multiple files at once** (drag-drop or picker). The browser
 redacts them one at a time and shows a per-file status with an individual download
@@ -51,7 +62,7 @@ Run from the project root so the `app` package resolves:
 
 ```bash
 python -m tests.verify        # 38 redaction checks (DOCX/PDF/analyzer/OCR, in-memory fixtures)
-python -m tests.verify_http   # 16 full-stack checks (routing, upload, headers, errors)
+python -m tests.verify_http   # 21 full-stack checks (routing, job flow, headers, errors)
 ```
 
 ## Deploy (Render, free tier)
@@ -83,10 +94,12 @@ instance).
   `tessdata/eng.traineddata`, committed to the repo, is needed). OCR findings are
   trusted only where the text layer is blind, and redactions on those pages also
   delete touched vector line art so outlines are removed, not just covered.
-  Budget ~10 s per affected page. If OCR can't run (e.g. tessdata missing), the
-  app returns a per-file warning (shown in the UI via the `X-Redaction-Warnings`
-  response header) naming the pages to review manually. OCR is best-effort:
-  unusual fonts/colors can still evade it — spot-check stylized documents.
+  Budget ~10 s per affected page locally — several minutes on Render's free
+  0.1-CPU instance (the job flow + UI elapsed counter make that survivable). If
+  OCR can't run (e.g. tessdata missing), the job's status response carries a
+  per-file warning (shown amber in the UI) naming the pages to review manually.
+  OCR is best-effort: unusual fonts/colors can still evade it — spot-check
+  stylized documents.
 - **Invisible characters are neutralized.** Zero-width spaces and similar
   characters that some exporters glue onto words (which used to hide names from
   the NER model) are converted to spaces before analysis.

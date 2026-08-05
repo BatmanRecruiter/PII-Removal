@@ -82,14 +82,35 @@ function setRowState(row, state, html) {
   row.detail.innerHTML = html || "";
 }
 
-// The server sends warnings as a percent-encoded JSON array in a header.
-function parseWarnings(header) {
-  if (!header) return [];
-  try {
-    const list = JSON.parse(decodeURIComponent(header));
-    return Array.isArray(list) ? list : [];
-  } catch (_) {
-    return [];
+const POLL_MS = 2500;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Poll the job until it finishes; returns {ok, warnings?, error?}.
+// Slow is normal here: OCR-heavy files take minutes on the small server.
+async function waitForJob(jobId, row) {
+  const started = Date.now();
+  for (;;) {
+    await sleep(POLL_MS);
+    let res;
+    try {
+      res = await fetch(`/jobs/${jobId}`);
+    } catch (_) {
+      continue; // transient network blip — keep polling
+    }
+    if (res.status === 404) return { ok: false, error: "Job expired — please retry" };
+    let data = {};
+    try { data = await res.json(); } catch (_) { /* keep polling */ }
+    if (!res.ok) return { ok: false, error: data.error || data.detail || "Failed to process" };
+
+    if (data.state === "done") return { ok: true, warnings: data.warnings || [] };
+    const secs = Math.round((Date.now() - started) / 1000);
+    const note = data.state === "queued" && data.queue_position > 0
+      ? `Waiting (${data.queue_position} ahead)…`
+      : `Removing PII… ${secs}s`;
+    setRowState(row, "processing", note);
   }
 }
 
@@ -104,7 +125,7 @@ async function redactOne(file, row) {
   const bad = localError(file);
   if (bad) { setRowState(row, "error", bad); return false; }
 
-  setRowState(row, "processing", "Removing PII…");
+  setRowState(row, "processing", "Uploading…");
   const body = new FormData();
   body.append("file", file, file.name);
 
@@ -116,19 +137,35 @@ async function redactOne(file, row) {
     return false;
   }
 
-  if (!res.ok) {
-    let msg = "Failed to process";
-    try {
-      const data = await res.json();
-      msg = (data && (data.error || data.detail)) || msg;
-    } catch (_) { /* non-JSON */ }
-    setRowState(row, "error", msg);
+  let submitted = {};
+  try { submitted = await res.json(); } catch (_) { /* non-JSON */ }
+  if (!res.ok || !submitted.job_id) {
+    setRowState(row, "error", submitted.error || submitted.detail || "Failed to process");
     return false;
   }
 
-  const blob = await res.blob();
+  setRowState(row, "processing", "Removing PII…");
+  const outcome = await waitForJob(submitted.job_id, row);
+  if (!outcome.ok) {
+    setRowState(row, "error", outcome.error);
+    return false;
+  }
+
+  let dl;
+  try {
+    dl = await fetch(`/jobs/${submitted.job_id}/download`);
+  } catch (_) {
+    setRowState(row, "error", "Network error");
+    return false;
+  }
+  if (!dl.ok) {
+    setRowState(row, "error", "Download failed — please retry");
+    return false;
+  }
+
+  const blob = await dl.blob();
   const fallback = file.name.replace(/(\.[^.]+)$/, " - Redacted$1");
-  const outName = filenameFromDisposition(res.headers.get("Content-Disposition"), fallback);
+  const outName = filenameFromDisposition(dl.headers.get("Content-Disposition"), fallback);
   const url = URL.createObjectURL(blob);
   objectUrls.push(url);
 
@@ -141,7 +178,7 @@ async function redactOne(file, row) {
   row.detail.appendChild(link);
 
   // Server-side warnings (e.g. text drawn as graphics that couldn't be scanned).
-  for (const msg of parseWarnings(res.headers.get("X-Redaction-Warnings"))) {
+  for (const msg of outcome.warnings) {
     const warn = document.createElement("p");
     warn.className = "row-warning";
     warn.textContent = "⚠ " + msg;

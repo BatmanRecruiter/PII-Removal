@@ -1,9 +1,14 @@
-"""FastAPI app: serves the frontend and the stateless /redact endpoint.
+"""FastAPI app: serves the frontend and the stateless redaction endpoints.
 
 Everything is processed in memory — no file is ever written to disk and nothing
-is persisted between requests.
+is persisted between requests (finished results are held in RAM only until
+downloaded or expired; see app/jobs.py).
+
+Redaction runs as a background job: POST /redact validates the upload and
+returns a job id at once; the browser polls GET /jobs/{id} and then fetches
+GET /jobs/{id}/download. Long uploads would otherwise be killed by the hosting
+proxy and starve the event loop while OCR runs.
 """
-import json
 import os
 from io import BytesIO
 from urllib.parse import quote
@@ -12,6 +17,8 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import jobs
+from .analyzer import get_analyzer
 from .config import MAX_UPLOAD_BYTES
 from .redact_docx import redact_docx
 from .redact_pdf import ScannedPDFError, redact_pdf
@@ -32,6 +39,12 @@ app = FastAPI(title="PII Redactor", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+@app.on_event("startup")
+def preload_model() -> None:
+    """Load the spaCy model while booting, not during the first user's upload."""
+    get_analyzer()
+
+
 @app.get("/")
 def index():
     return FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -49,6 +62,7 @@ def _redacted_name(original: str) -> str:
 
 @app.post("/redact")
 async def redact(file: UploadFile = File(...)):
+    """Validate the upload and queue it; returns {"job_id": ...} immediately."""
     _stem, ext = os.path.splitext(file.filename or "")
     ext = ext.lower()
     if ext not in _HANDLERS:
@@ -65,21 +79,40 @@ async def redact(file: UploadFile = File(...)):
     if not data.startswith(magic):
         raise HTTPException(415, f"File content does not look like a valid {ext} file.")
 
-    try:
-        result, warnings = redact_fn(data)
-    except ScannedPDFError as exc:
-        return JSONResponse(status_code=422, content={"error": str(exc)})
-    except Exception:
-        raise HTTPException(500, "Failed to process the document. It may be corrupt.")
+    job_id = jobs.submit(
+        filename=_redacted_name(file.filename),
+        mime=mime,
+        data=data,
+        redact_fn=redact_fn,
+        known_error=ScannedPDFError,
+    )
+    return {"job_id": job_id}
 
-    out_name = _redacted_name(file.filename)
+
+@app.get("/jobs/{job_id}")
+def job_status(job_id: str):
+    job = jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, "Unknown or expired job.")
+    body = {"state": job.state}
+    if job.state == "queued":
+        body["queue_position"] = jobs.queue_position(job_id)
+    elif job.state == "done":
+        body["warnings"] = job.warnings
+    elif job.state == "error":
+        return JSONResponse(status_code=job.error_status, content={"error": job.error})
+    return body
+
+
+@app.get("/jobs/{job_id}/download")
+def job_download(job_id: str):
+    job = jobs.take_result(job_id)
+    if job is None:
+        raise HTTPException(404, "Result not ready, already downloaded, or expired.")
     # RFC 5987 encoding handles spaces/unicode in the filename safely.
-    headers = {"Content-Disposition": f"attachment; filename*=UTF-8''{quote(out_name)}"}
-    if warnings:
-        # Header values must be latin-1; percent-encode the JSON list to be safe.
-        headers["X-Redaction-Warnings"] = quote(json.dumps(warnings))
+    disposition = f"attachment; filename*=UTF-8''{quote(job.filename)}"
     return StreamingResponse(
-        BytesIO(result),
-        media_type=mime,
-        headers=headers,
+        BytesIO(job.result),
+        media_type=job.mime,
+        headers={"Content-Disposition": disposition},
     )
